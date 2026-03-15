@@ -1,15 +1,22 @@
 package main
 
 import (
+	"flag"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"google.golang.org/protobuf/compiler/protogen"
-	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 func main() {
-	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+	var flags flag.FlagSet
+	packageName := flags.String("package", "", "Generated package name (overrides proto package)")
+	flags.Parse(os.Args[1:])
+
+	protogen.Options{
+		ParamFunc: flags.Set,
+	}.Run(func(gen *protogen.Plugin) error {
 		gen.SupportedFeatures = uint64(^uint(0))
 
 		for _, f := range gen.Files {
@@ -17,21 +24,22 @@ func main() {
 				continue
 			}
 
-			// Generate a separate file for each proto file
 			var services []serviceInfo
 			for _, svc := range f.Services {
 				services = append(services, extractServiceInfo(svc))
 			}
 
 			if len(services) > 0 {
-				// Generate separate file per proto (e.g., user_echo.pb.go)
-				// Extract base name from GeneratedFilenamePrefix
 				baseName := filepath.Base(f.GeneratedFilenamePrefix)
 				outputFilename := baseName + "_echo.pb.go"
-				g := gen.NewGeneratedFile(
-					outputFilename,
-					"brian/sp/sp-server/api/proto",
-				)
+
+				// Use provided package name or fall back to proto package
+				pkg := string(f.GoPackageName)
+				if *packageName != "" {
+					pkg = *packageName
+				}
+
+				g := gen.NewGeneratedFile(outputFilename, protogen.GoImportPath(pkg))
 				generateHandlerInterfaces(g, services)
 			}
 		}
@@ -47,14 +55,15 @@ type serviceInfo struct {
 }
 
 type methodInfo struct {
-	GoName     string
-	HTTPMethod string
-	Path       string
-	Body       string
-	HasBody    bool
-	PathParams []string
-	InputName  string
-	OutputName string
+	GoName      string
+	HTTPMethod  string
+	Path        string
+	Body        string
+	HasBody     bool
+	PathParams  []string
+	QueryParams []string
+	InputName   string
+	OutputName  string
 }
 
 func extractServiceInfo(svc *protogen.Service) serviceInfo {
@@ -70,16 +79,18 @@ func extractServiceInfo(svc *protogen.Service) serviceInfo {
 
 		httpMethod, path, body := getHTTPBinding(method)
 		pathParams := extractPathParams(path)
+		queryParams := extractQueryParams(method)
 
 		info.Methods = append(info.Methods, methodInfo{
-			GoName:     method.GoName,
-			HTTPMethod: httpMethod,
-			Path:       path,
-			Body:       body,
-			HasBody:    body != "" && body != "*",
-			PathParams: pathParams,
-			InputName:  method.Input.GoIdent.GoName,
-			OutputName: method.Output.GoIdent.GoName,
+			GoName:      method.GoName,
+			HTTPMethod:  httpMethod,
+			Path:        path,
+			Body:        body,
+			HasBody:     body != "" && body != "*",
+			PathParams:  pathParams,
+			QueryParams: queryParams,
+			InputName:   method.Input.GoIdent.GoName,
+			OutputName:  method.Output.GoIdent.GoName,
 		})
 	}
 
@@ -98,14 +109,33 @@ func extractPathParams(path string) []string {
 	return params
 }
 
+func extractQueryParams(method *protogen.Method) []string {
+	// TODO: Implement google.api.http annotation parsing for query parameters
+	// This requires parsing the method options to extract query fields
+	return nil
+}
+
 func isStreamingMethod(method *protogen.Method) bool {
 	desc := method.Desc
 	return desc.IsStreamingClient() || desc.IsStreamingServer()
 }
 
 func getHTTPBinding(method *protogen.Method) (methodName, path, body string) {
+	// First try to get from google.api.http annotation
+	if httpMethod, httpPath, httpBody := getGoogleAPIHTTPBinding(method); httpMethod != "" {
+		return httpMethod, httpPath, httpBody
+	}
+	// Fallback to auto mapping
 	m, p := getHTTPMapping(method)
 	return m, p, ""
+}
+
+// getGoogleAPIHTTPBinding parses google.api.http annotation
+// TODO: Implement full annotation parsing
+func getGoogleAPIHTTPBinding(method *protogen.Method) (methodName, path, body string) {
+	// Placeholder for future implementation
+	// Would need to parse the google.api.http extension
+	return "", "", ""
 }
 
 // getHTTPMapping is fallback when no google.api.http annotation
@@ -182,8 +212,13 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	// Generate imports
 	g.P("import (")
 	g.P(`	"context"`)
+	g.P(`	"errors"`)
 	g.P(`	"github.com/labstack/echo/v5"`)
 	g.P(")")
+	g.P()
+
+	// Generate error types
+	generateErrorTypes(g)
 	g.P()
 
 	// Generate handler interfaces for each service
@@ -193,6 +228,27 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 
 	// Generate route registration helper
 	generateRouteHelpers(g, services)
+}
+
+func generateErrorTypes(g *protogen.GeneratedFile) {
+	g.P("// APIError represents a structured API error")
+	g.P("type APIError struct {")
+	g.P("\tCode    int    `json:\"code\"`")
+	g.P("\tMessage string `json:\"message\"`")
+	g.P("}")
+	g.P()
+	g.P("func (e *APIError) Error() string {")
+	g.P("\treturn e.Message")
+	g.P("}")
+	g.P()
+	g.P("var (")
+	g.P("\tErrBadRequest     = &APIError{Code: 400, Message: \"bad request\"}")
+	g.P("\tErrUnauthorized  = &APIError{Code: 401, Message: \"unauthorized\"}")
+	g.P("\tErrForbidden     = &APIError{Code: 403, Message: \"forbidden\"}")
+	g.P("\tErrNotFound      = &APIError{Code: 404, Message: \"not found\"}")
+	g.P("\tErrInternalError = &APIError{Code: 500, Message: \"internal server error\"}")
+	g.P(")")
+	g.P()
 }
 
 func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo) {
@@ -218,7 +274,7 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo) {
 		g.P("func (a *", svc.HandlerGo, "Adapter) ", method.GoName, "(c *echo.Context) error {")
 		g.P("\tvar req ", method.InputName)
 		g.P("\tif err := c.Bind(&req); err != nil {")
-		g.P("\t\treturn c.JSON(400, map[string]string{\"error\": err.Error()})")
+		g.P("\t\treturn c.JSON(400, &APIError{Code: 400, Message: err.Error()})")
 		g.P("\t}")
 		g.P()
 
@@ -231,9 +287,25 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo) {
 		}
 		g.P()
 
+		// Bind query parameters (if any)
+		if len(method.QueryParams) > 0 {
+			for _, param := range method.QueryParams {
+				fieldName := toFieldName(param)
+				g.P("\tif v := c.QueryParam(\"", param, "\"); v != \"\" {")
+				g.P("\t\treq.", fieldName, " = v")
+				g.P("\t}")
+			}
+			g.P()
+		}
+
 		g.P("\tresp, err := a.Handler.", method.GoName, "(c.Request().Context(), &req)")
 		g.P("\tif err != nil {")
-		g.P("\t\treturn c.JSON(500, map[string]string{\"error\": err.Error()})")
+		g.P("\t\tswitch e := err.(type) {")
+		g.P("\t\tcase *APIError:")
+		g.P("\t\t\treturn c.JSON(e.Code, e)")
+		g.P("\t\tdefault:")
+		g.P("\t\t\treturn c.JSON(500, &APIError{Code: 500, Message: err.Error()})")
+		g.P("\t\t}")
 		g.P("\t}")
 		g.P()
 		g.P("\treturn c.JSON(200, resp)")
@@ -269,15 +341,12 @@ func toFieldName(param string) string {
 }
 
 func generateRouteHelpers(g *protogen.GeneratedFile, services []serviceInfo) {
-	// Generate a separate registration function for each service
-	// This avoids conflicts when multiple *_echo.pb.go files are used together
 	for _, svc := range services {
 		generateServiceRegistration(g, svc)
 	}
 }
 
 func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
-	// Generate RegisterXXXServiceHandlers function
 	funcName := "Register" + svc.GoName + "Handlers"
 	g.P("// ", funcName, " registers ", svc.GoName, " handlers to the echo group.")
 	g.P("func ", funcName, "(")
@@ -286,13 +355,11 @@ func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
 	g.P(") {")
 	g.P()
 
-	// Create adapter and register routes
 	adapterName := toAdapterName(svc.GoName)
 	g.P("\t", adapterName, " := &", svc.HandlerGo, "Adapter{Handler: h}")
 	g.P()
 
 	for _, method := range svc.Methods {
-		// Convert /v1/users/{id} to /users/:id
 		path := convertPath(method.Path)
 		g.P("\tg.", method.HTTPMethod, `("`, path, `", `, adapterName, ".", method.GoName, ")")
 	}
@@ -303,11 +370,6 @@ func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
 func toAdapterName(serviceName string) string {
 	firstChar := strings.ToLower(string(serviceName[0]))
 	return firstChar + serviceName[1:] + "Adapter"
-}
-
-func toVarName(serviceName string) string {
-	firstChar := strings.ToLower(string(serviceName[0]))
-	return firstChar + strings.TrimSuffix(serviceName[1:], "Service") + "Handler"
 }
 
 func convertPath(path string) string {
@@ -338,7 +400,5 @@ func convertPathParams(path string) string {
 	return result.String()
 }
 
-// Keep for potential future use
-var _ = descriptorpb.MethodOptions{}
-
-const version = "v0.4.0"
+// version can be set via -ldflags during build
+var version = "dev"
