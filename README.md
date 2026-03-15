@@ -7,7 +7,8 @@ A protoc plugin that generates Echo HTTP handler interfaces from protobuf servic
 - Auto-generates Go HTTP handler interfaces from protobuf `Service` definitions
 - Supports automatic route mapping (Get, List, Create, Update, Delete, Login, Register, etc.)
 - Generates Echo framework adapters for direct integration with Echo routes
-- Supports automatic path parameter binding
+- Supports automatic path and query parameter binding
+- Built-in API error handling with structured `APIError` type
 
 ## Installation
 
@@ -57,6 +58,18 @@ message User {
 
 ```bash
 protoc --echo-http_out=. --echo-http_opt=paths=source_relative your.proto
+```
+
+#### Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `package` | Override generated package name | Proto package |
+| `paths` | Output path mode (`source_relative` or `inline`) | `source_relative` |
+
+```bash
+# With custom package name
+protoc --echo-http_out=. --echo-http_opt=package=mypkg your.proto
 ```
 
 ### 3. Implement Handler
@@ -121,6 +134,13 @@ task clean
 - google.golang.org/protobuf v1.36.1
 - github.com/labstack/echo/v5
 
+## Build
+
+```bash
+# Build with version
+go build -ldflags "-X main.version=v1.0.0" -o protoc-gen-echo-http .
+```
+
 ## Generated Code
 
 Running the plugin generates `_echo.pb.go` files containing:
@@ -128,3 +148,29 @@ Running the plugin generates `_echo.pb.go` files containing:
 1. **Handler Interface** - e.g., `UserHandler`, defines all HTTP methods
 2. **Adapter** - e.g., `UserHandlerAdapter`, converts interface to Echo handler
 3. **Registration Function** - e.g., `RegisterUserServiceHandlers`, for easy route registration
+4. **Error Types** - `APIError` struct and common error constants (`ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`, `ErrInternalError`)
+
+### Error Handling
+
+The generated adapter returns structured `APIError` responses:
+
+```go
+// Return an error from your handler
+func (h *UserHandlerImpl) GetUser(ctx context.Context, req *proto.GetUserRequest) (*proto.User, error) {
+    if req.Id == "" {
+        return nil, proto.ErrBadRequest
+    }
+    // ...
+}
+```
+
+Error responses are automatically mapped to appropriate HTTP status codes:
+
+| Error Constant | HTTP Status |
+|-----------------|-------------|
+| `ErrBadRequest` | 400 |
+| `ErrUnauthorized` | 401 |
+| `ErrForbidden` | 403 |
+| `ErrNotFound` | 404 |
+| `ErrInternalError` | 500 |
+| Custom `APIError` | Custom code |
