@@ -1,0 +1,19 @@
+# Taskfile for protoc-gen-echo-http
+
+version: '3'
+
+tasks:
+  build:
+    desc: Build the protoc plugin
+    cmds:
+      - go build -o protoc-gen-echo-http .
+
+  install:
+    desc: Install the plugin to $GOPATH/bin
+    cmds:
+      - go install .
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f protoc-gen-echo-http
