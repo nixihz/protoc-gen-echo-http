@@ -7,7 +7,11 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
+
+	"google.golang.org/genproto/googleapis/api/annotations"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 func main() {
@@ -85,6 +89,7 @@ type methodInfo struct {
 	QueryParams []string
 	InputName   string
 	OutputName  string
+	ProtoMethod *protogen.Method // for field type lookup
 }
 
 func extractServiceInfo(svc *protogen.Service) serviceInfo {
@@ -112,6 +117,7 @@ func extractServiceInfo(svc *protogen.Service) serviceInfo {
 			QueryParams: queryParams,
 			InputName:   method.Input.GoIdent.GoName,
 			OutputName:  method.Output.GoIdent.GoName,
+			ProtoMethod: method,
 		})
 	}
 
@@ -152,10 +158,38 @@ func getHTTPBinding(method *protogen.Method) (methodName, path, body string) {
 }
 
 // getGoogleAPIHTTPBinding parses google.api.http annotation
-// TODO: Implement full annotation parsing
 func getGoogleAPIHTTPBinding(method *protogen.Method) (methodName, path, body string) {
-	// Placeholder for future implementation
-	// Would need to parse the google.api.http extension
+	// Get the method options
+	opts := method.Desc.Options()
+
+	// Try to get the http extension
+	ext := proto.GetExtension(opts, annotations.E_Http)
+	if ext == nil {
+		return "", "", ""
+	}
+
+	httpRule, ok := ext.(*annotations.HttpRule)
+	if !ok || httpRule == nil {
+		return "", "", ""
+	}
+
+	// Get the HTTP method and path
+	if httpRule.GetGet() != "" {
+		return "GET", httpRule.GetGet(), ""
+	}
+	if httpRule.GetPost() != "" {
+		return "POST", httpRule.GetPost(), httpRule.GetBody()
+	}
+	if httpRule.GetPut() != "" {
+		return "PUT", httpRule.GetPut(), httpRule.GetBody()
+	}
+	if httpRule.GetDelete() != "" {
+		return "DELETE", httpRule.GetDelete(), ""
+	}
+	if httpRule.GetPatch() != "" {
+		return "PATCH", httpRule.GetPatch(), httpRule.GetBody()
+	}
+
 	return "", "", ""
 }
 
@@ -230,9 +264,35 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	g.P("package ", pkgName)
 	g.P()
 
+	// Check if strconv is needed (numeric path params)
+	needsStrconv := false
+	for _, svc := range services {
+		for _, method := range svc.Methods {
+			if len(method.PathParams) > 0 && method.ProtoMethod != nil {
+				for _, param := range method.PathParams {
+					kind := getFieldType(method.ProtoMethod, param)
+					if kind == protoreflect.Uint32Kind || kind == protoreflect.Uint64Kind ||
+						kind == protoreflect.Int32Kind || kind == protoreflect.Int64Kind {
+						needsStrconv = true
+						break
+					}
+				}
+			}
+			if needsStrconv {
+				break
+			}
+		}
+		if needsStrconv {
+			break
+		}
+	}
+
 	// Generate imports
 	g.P("import (")
 	g.P(`	"context"`)
+	if needsStrconv {
+		g.P(`	"strconv"`)
+	}
 	g.P(`	"github.com/labstack/echo/v5"`)
 	if errorPkg != "" {
 		// Extract package alias from path
@@ -338,9 +398,7 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo, errorP
 		// Bind path parameters
 		for _, param := range method.PathParams {
 			fieldName := toFieldName(param)
-			g.P("\tif v := c.Param(\"", param, "\"); v != \"\" {")
-			g.P("\t\treq.", fieldName, " = v")
-			g.P("\t}")
+			generatePathParamBinding(g, method.ProtoMethod, param, fieldName) // param = proto name, fieldName = Go name
 		}
 		g.P()
 
@@ -374,6 +432,53 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo, errorP
 		g.P("\treturn c.JSON(200, resp)")
 		g.P("}")
 		g.P()
+	}
+}
+
+// getFieldType returns the protobuf type kind for a field by name in the input message.
+func getFieldType(method *protogen.Method, fieldName string) protoreflect.Kind {
+	input := method.Input
+	for _, field := range input.Fields {
+		if string(field.Desc.Name()) == fieldName {
+			return field.Desc.Kind()
+		}
+	}
+	return protoreflect.Kind(0) // InvalidKind
+}
+
+// generatePathParamBinding generates path parameter binding code with type conversion.
+func generatePathParamBinding(g *protogen.GeneratedFile, method *protogen.Method, param string, fieldName string) {
+	g.P("\tif v := c.Param(\"", param, "\"); v != \"\" {")
+	kind := getFieldType(method, param) // param = proto field name
+	switch kind {
+	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
+		g.P("\t\tif parsed, err := strconv.ParseUint(v, 10, 64); err == nil {")
+		g.P("\t\t\treq.", fieldName, " = ", castToFieldType("parsed", kind))
+		g.P("\t\t}")
+	case protoreflect.Int32Kind, protoreflect.Int64Kind:
+		g.P("\t\tif parsed, err := strconv.ParseInt(v, 10, 64); err == nil {")
+		g.P("\t\t\treq.", fieldName, " = ", castToFieldType("parsed", kind))
+		g.P("\t\t}")
+	default:
+		// String fields: direct assignment
+		g.P("\t\treq.", fieldName, " = v")
+	}
+	g.P("\t}")
+}
+
+// castToFieldType generates a type cast expression for numeric types.
+func castToFieldType(val string, kind protoreflect.Kind) string {
+	switch kind {
+	case protoreflect.Uint32Kind:
+		return "uint32(" + val + ")"
+	case protoreflect.Uint64Kind:
+		return "uint64(" + val + ")"
+	case protoreflect.Int32Kind:
+		return "int32(" + val + ")"
+	case protoreflect.Int64Kind:
+		return "int64(" + val + ")"
+	default:
+		return val
 	}
 }
 
