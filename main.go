@@ -41,8 +41,22 @@ func main() {
 
 			if len(services) > 0 {
 				// Get the output path relative to the proto file's directory for source_relative mode
-				// GeneratedFilenamePrefix is like "api/md5/admin" for "api/md5/admin.proto"
-				outputFilename := f.GeneratedFilenamePrefix + "_echo.pb.go"
+				// Use f.Desc.Path() to get the proto file path (e.g., "api/md5/admin.proto")
+				// The output filename should be relative to the proto file's directory,
+				// not including the proto root (which is handled by buf's out parameter)
+				protoPath := f.Desc.Path()
+				protoDir := filepath.Dir(protoPath)
+				protoName := filepath.Base(protoPath)
+				baseName := strings.TrimSuffix(protoName, filepath.Ext(protoName))
+				// Strip the first directory component (proto root) from the path
+				// e.g., "api/md5/admin.proto" -> "md5/admin.proto" -> "md5/admin_echo.pb.go"
+				parts := strings.SplitN(protoDir, "/", 2)
+				if len(parts) > 1 {
+					protoDir = parts[1]
+				} else {
+					protoDir = ""
+				}
+				outputFilename := filepath.Join(protoDir, baseName+"_echo.pb.go")
 
 				// Determine package name from proto file path (directory name)
 				// For paths=source_relative, use the directory name as package name
