@@ -324,7 +324,7 @@ message User { string id = 1; }
 	generated := readFile(t, tmpDir, "out/api/user_echo.pb.go")
 	assertNotContains(t, generated, "g *echo.Group")
 	assertContains(t, generated, "r interface {")
-	assertContains(t, generated, "GET(path string, h echo.HandlerFunc)")
+	assertContains(t, generated, "GET(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
 }
 
 func TestGeneratedCodeUsesHTTPStatusConstants(t *testing.T) {

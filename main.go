@@ -294,7 +294,9 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	// Generate imports
 	g.P("import (")
 	g.P(`	"context"`)
-	g.P(`	"errors"`)
+	if !generatedErrorTypes[errorTypesKey] && (errorPkg == "" || errorType == "") {
+		g.P(`	"errors"`)
+	}
 	g.P(`	"net/http"`)
 	if needsStrconvServices(services) {
 		g.P(`	"strconv"`)
@@ -478,11 +480,11 @@ func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
 	g.P("// ", funcName, " registers ", svc.GoName, " handlers to the router.")
 	g.P("func ", funcName, "(")
 	g.P("\tr interface {")
-	g.P("\t\tGET(path string, h echo.HandlerFunc)")
-	g.P("\t\tPOST(path string, h echo.HandlerFunc)")
-	g.P("\t\tPUT(path string, h echo.HandlerFunc)")
-	g.P("\t\tDELETE(path string, h echo.HandlerFunc)")
-	g.P("\t\tPATCH(path string, h echo.HandlerFunc)")
+	g.P("\t\tGET(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
+	g.P("\t\tPOST(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
+	g.P("\t\tPUT(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
+	g.P("\t\tDELETE(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
+	g.P("\t\tPATCH(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) echo.RouteInfo")
 	g.P("\t},")
 	g.P("\th ", svc.HandlerGo, ",")
 	g.P(") {")
