@@ -4,7 +4,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"google.golang.org/genproto/googleapis/api/annotations"
@@ -14,7 +13,6 @@ import (
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
-var _ = strconv.ParseInt // strconv is used in generated code output, not in main.go directly
 
 func main() {
 	var flags flag.FlagSet
@@ -200,13 +198,6 @@ func isStreamingMethod(method *protogen.Method) bool {
 	return desc.IsStreamingClient() || desc.IsStreamingServer()
 }
 
-func isNumericKind(kind protoreflect.Kind) bool {
-	return kind == protoreflect.Int32Kind ||
-		kind == protoreflect.Int64Kind ||
-		kind == protoreflect.Uint32Kind ||
-		kind == protoreflect.Uint64Kind
-}
-
 func getFieldKind(method *protogen.Method, fieldName string) protoreflect.Kind {
 	for _, field := range method.Input.Fields {
 		if string(field.Desc.Name()) == fieldName {
@@ -219,12 +210,18 @@ func getFieldKind(method *protogen.Method, fieldName string) protoreflect.Kind {
 func needsStrconvParam(methods []methodInfo) bool {
 	for _, m := range methods {
 		for _, p := range m.PathParams {
-			if isNumericKind(getFieldKind(m.ProtoMethod, p.Name)) {
+			kind := getFieldKind(m.ProtoMethod, p.Name)
+			if kind == protoreflect.Int32Kind || kind == protoreflect.Int64Kind ||
+				kind == protoreflect.Uint32Kind || kind == protoreflect.Uint64Kind ||
+				kind == protoreflect.FloatKind || kind == protoreflect.DoubleKind {
 				return true
 			}
 		}
 		for _, p := range m.QueryParams {
-			if isNumericKind(getFieldKind(m.ProtoMethod, p.Name)) {
+			kind := getFieldKind(m.ProtoMethod, p.Name)
+			if kind == protoreflect.Int32Kind || kind == protoreflect.Int64Kind ||
+				kind == protoreflect.Uint32Kind || kind == protoreflect.Uint64Kind ||
+				kind == protoreflect.FloatKind || kind == protoreflect.DoubleKind {
 				return true
 			}
 		}
@@ -293,29 +290,6 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	g.P()
 	g.P("package ", pkgName)
 	g.P()
-
-	// Check if strconv is needed (numeric path params)
-	needsStrconv := false
-	for _, svc := range services {
-		for _, method := range svc.Methods {
-			if len(method.PathParams) > 0 && method.ProtoMethod != nil {
-				for _, param := range method.PathParams {
-					kind := getFieldType(method.ProtoMethod, param.Name)
-					if kind == protoreflect.Uint32Kind || kind == protoreflect.Uint64Kind ||
-						kind == protoreflect.Int32Kind || kind == protoreflect.Int64Kind {
-						needsStrconv = true
-						break
-					}
-				}
-			}
-			if needsStrconv {
-				break
-			}
-		}
-		if needsStrconv {
-			break
-		}
-	}
 
 	// Generate imports
 	g.P("import (")
@@ -581,6 +555,18 @@ func generateParamBinding(g *protogen.GeneratedFile, method *protogen.Method, pa
 		g.P("\t\treq.", param.FieldGoName, " = uint32(parsed)")
 	case protoreflect.Uint64Kind:
 		g.P("\t\tparsed, err := strconv.ParseUint(v, 10, 64)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = parsed")
+	case protoreflect.FloatKind:
+		g.P("\t\tparsed, err := strconv.ParseFloat(v, 32)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = float32(parsed)")
+	case protoreflect.DoubleKind:
+		g.P("\t\tparsed, err := strconv.ParseFloat(v, 64)")
 		g.P("\t\tif err != nil {")
 		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
 		g.P("\t\t}")
