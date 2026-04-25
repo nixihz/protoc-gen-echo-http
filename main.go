@@ -4,15 +4,17 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"google.golang.org/genproto/googleapis/api/annotations"
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/pluginpb"
-
-	"google.golang.org/genproto/googleapis/api/annotations"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/pluginpb"
 )
+
+var _ = strconv.ParseInt // strconv is used in generated code output, not in main.go directly
 
 func main() {
 	var flags flag.FlagSet
@@ -43,19 +45,11 @@ func main() {
 				// Get the output path relative to the proto file's directory for source_relative mode
 				// Use f.Desc.Path() to get the proto file path (e.g., "api/md5/admin.proto")
 				// The output filename should be relative to the proto file's directory,
-				// not including the proto root (which is handled by buf's out parameter)
+				// matching the behavior of protoc-gen-go with paths=source_relative
 				protoPath := f.Desc.Path()
 				protoDir := filepath.Dir(protoPath)
 				protoName := filepath.Base(protoPath)
 				baseName := strings.TrimSuffix(protoName, filepath.Ext(protoName))
-				// Strip the first directory component (proto root) from the path
-				// e.g., "api/md5/admin.proto" -> "md5/admin.proto" -> "md5/admin_echo.pb.go"
-				parts := strings.SplitN(protoDir, "/", 2)
-				if len(parts) > 1 {
-					protoDir = parts[1]
-				} else {
-					protoDir = ""
-				}
 				outputFilename := filepath.Join(protoDir, baseName+"_echo.pb.go")
 
 				// Determine package name from proto file path (directory name)
@@ -79,7 +73,11 @@ func main() {
 				}
 
 				g := gen.NewGeneratedFile(outputFilename, goImportPath)
-				generateHandlerInterfaces(g, services, goPackage, generatedErrorTypes, *errorPkg, *errorType)
+				errorTypesKey := string(goImportPath)
+				if errorTypesKey == "" {
+					errorTypesKey = outputFilename + ":" + goPackage
+				}
+				generateHandlerInterfaces(g, services, goPackage, errorTypesKey, generatedErrorTypes, *errorPkg, *errorType)
 			}
 		}
 
@@ -97,13 +95,16 @@ type methodInfo struct {
 	GoName      string
 	HTTPMethod  string
 	Path        string
-	Body        string
-	HasBody     bool
-	PathParams  []string
-	QueryParams []string
-	InputName   string
-	OutputName  string
+	PathParams  []paramBinding
+	QueryParams []paramBinding
+	InputIdent  protogen.GoIdent
+	OutputIdent protogen.GoIdent
 	ProtoMethod *protogen.Method // for field type lookup
+}
+
+type paramBinding struct {
+	Name        string
+	FieldGoName string
 }
 
 func extractServiceInfo(svc *protogen.Service) serviceInfo {
@@ -118,19 +119,20 @@ func extractServiceInfo(svc *protogen.Service) serviceInfo {
 		}
 
 		httpMethod, path, body := getHTTPBinding(method)
-		pathParams := extractPathParams(path)
-		queryParams := extractQueryParams(method)
+		if httpMethod == "" {
+			continue
+		}
+		pathParams := extractPathParamBindings(method, path)
+		queryParams := extractQueryParamBindings(method, path, body)
 
 		info.Methods = append(info.Methods, methodInfo{
 			GoName:      method.GoName,
 			HTTPMethod:  httpMethod,
 			Path:        path,
-			Body:        body,
-			HasBody:     body != "" && body != "*",
 			PathParams:  pathParams,
 			QueryParams: queryParams,
-			InputName:   method.Input.GoIdent.GoName,
-			OutputName:  method.Output.GoIdent.GoName,
+			InputIdent:  method.Input.GoIdent,
+			OutputIdent: method.Output.GoIdent,
 			ProtoMethod: method,
 		})
 	}
@@ -142,18 +144,55 @@ func extractPathParams(path string) []string {
 	var params []string
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
-		if strings.HasPrefix(part, "{") {
-			param := strings.Trim(part, "{}")
+		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
+			param := part[1 : len(part)-1]
 			params = append(params, strings.Split(param, "=")[0])
 		}
 	}
 	return params
 }
 
-func extractQueryParams(method *protogen.Method) []string {
-	// TODO: Implement google.api.http annotation parsing for query parameters
-	// This requires parsing the method options to extract query fields
-	return nil
+func extractPathParamBindings(method *protogen.Method, path string) []paramBinding {
+	fieldNames := allFieldNames(method)
+	var bindings []paramBinding
+	for _, param := range extractPathParams(path) {
+		if fieldGoName, ok := fieldNames[param]; ok {
+			bindings = append(bindings, paramBinding{Name: param, FieldGoName: fieldGoName})
+		}
+	}
+	return bindings
+}
+
+func extractQueryParamBindings(method *protogen.Method, path string, body string) []paramBinding {
+	if body == "*" {
+		return nil
+	}
+
+	pathParams := make(map[string]bool)
+	for _, param := range extractPathParams(path) {
+		pathParams[param] = true
+	}
+
+	fieldNames := allFieldNames(method)
+	var bindings []paramBinding
+	for _, field := range method.Input.Fields {
+		fieldName := string(field.Desc.Name())
+		if pathParams[fieldName] || fieldName == body {
+			continue
+		}
+		if fieldGoName, ok := fieldNames[fieldName]; ok {
+			bindings = append(bindings, paramBinding{Name: fieldName, FieldGoName: fieldGoName})
+		}
+	}
+	return bindings
+}
+
+func allFieldNames(method *protogen.Method) map[string]string {
+	fieldNames := make(map[string]string)
+	for _, field := range method.Input.Fields {
+		fieldNames[string(field.Desc.Name())] = field.GoName
+	}
+	return fieldNames
 }
 
 func isStreamingMethod(method *protogen.Method) bool {
@@ -161,116 +200,93 @@ func isStreamingMethod(method *protogen.Method) bool {
 	return desc.IsStreamingClient() || desc.IsStreamingServer()
 }
 
+func isNumericKind(kind protoreflect.Kind) bool {
+	return kind == protoreflect.Int32Kind ||
+		kind == protoreflect.Int64Kind ||
+		kind == protoreflect.Uint32Kind ||
+		kind == protoreflect.Uint64Kind
+}
+
+func getFieldKind(method *protogen.Method, fieldName string) protoreflect.Kind {
+	for _, field := range method.Input.Fields {
+		if string(field.Desc.Name()) == fieldName {
+			return field.Desc.Kind()
+		}
+	}
+	return protoreflect.Kind(0)
+}
+
+func needsStrconvParam(methods []methodInfo) bool {
+	for _, m := range methods {
+		for _, p := range m.PathParams {
+			if isNumericKind(getFieldKind(m.ProtoMethod, p.Name)) {
+				return true
+			}
+		}
+		for _, p := range m.QueryParams {
+			if isNumericKind(getFieldKind(m.ProtoMethod, p.Name)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func needsStrconvServices(services []serviceInfo) bool {
+	for _, svc := range services {
+		if needsStrconvParam(svc.Methods) {
+			return true
+		}
+	}
+	return false
+}
+
 func getHTTPBinding(method *protogen.Method) (methodName, path, body string) {
-	// First try to get from google.api.http annotation
-	if httpMethod, httpPath, httpBody := getGoogleAPIHTTPBinding(method); httpMethod != "" {
-		return httpMethod, httpPath, httpBody
-	}
-	// Fallback to auto mapping
-	m, p := getHTTPMapping(method)
-	return m, p, ""
+	return getGoogleAPIHTTPBinding(method)
 }
 
-// getGoogleAPIHTTPBinding parses google.api.http annotation
+// getGoogleAPIHTTPBinding parses google.api.http annotation.
 func getGoogleAPIHTTPBinding(method *protogen.Method) (methodName, path, body string) {
-	// Get the method options
-	opts := method.Desc.Options()
-
-	// Try to get the http extension
-	ext := proto.GetExtension(opts, annotations.E_Http)
-	if ext == nil {
+	options := method.Desc.Options()
+	if options == nil || !proto.HasExtension(options, annotations.E_Http) {
 		return "", "", ""
 	}
 
-	httpRule, ok := ext.(*annotations.HttpRule)
-	if !ok || httpRule == nil {
+	ext := proto.GetExtension(options, annotations.E_Http)
+	rule, ok := ext.(*annotations.HttpRule)
+	if !ok || rule == nil {
 		return "", "", ""
 	}
 
-	// Get the HTTP method and path
-	if httpRule.GetGet() != "" {
-		return "GET", httpRule.GetGet(), ""
-	}
-	if httpRule.GetPost() != "" {
-		return "POST", httpRule.GetPost(), httpRule.GetBody()
-	}
-	if httpRule.GetPut() != "" {
-		return "PUT", httpRule.GetPut(), httpRule.GetBody()
-	}
-	if httpRule.GetDelete() != "" {
-		return "DELETE", httpRule.GetDelete(), ""
-	}
-	if httpRule.GetPatch() != "" {
-		return "PATCH", httpRule.GetPatch(), httpRule.GetBody()
+	switch pattern := rule.Pattern.(type) {
+	case *annotations.HttpRule_Get:
+		methodName, path = "GET", pattern.Get
+	case *annotations.HttpRule_Put:
+		methodName, path = "PUT", pattern.Put
+	case *annotations.HttpRule_Post:
+		methodName, path = "POST", pattern.Post
+	case *annotations.HttpRule_Delete:
+		methodName, path = "DELETE", pattern.Delete
+	case *annotations.HttpRule_Patch:
+		methodName, path = "PATCH", pattern.Patch
+	case *annotations.HttpRule_Custom:
+		if pattern.Custom != nil {
+			methodName, path = pattern.Custom.Kind, pattern.Custom.Path
+		}
 	}
 
+	if methodName != "" {
+		return methodName, path, rule.Body
+	}
 	return "", "", ""
-}
-
-// getHTTPMapping is fallback when no google.api.http annotation
-func getHTTPMapping(method *protogen.Method) (methodName, path string) {
-	name := method.GoName
-	serviceName := method.Parent.GoName
-	resourceName := strings.TrimSuffix(serviceName, "Service")
-	pluralResourceName := pluralize(resourceName)
-
-	switch {
-	case name == "Login":
-		return "POST", "/v1/" + toSnakeCase(pluralResourceName) + "/login"
-	case name == "Register":
-		return "POST", "/v1/" + toSnakeCase(pluralResourceName) + "/register"
-	case name == "Get"+resourceName || name == "Get"+resourceName+"ById":
-		return "GET", "/v1/" + toSnakeCase(pluralResourceName) + "/{id}"
-	case strings.HasPrefix(name, "Get"):
-		return "GET", "/v1/" + toSnakeCase(pluralize(strings.TrimPrefix(name, "Get")))
-	case strings.HasPrefix(name, "List"):
-		return "GET", "/v1/" + toSnakeCase(pluralize(strings.TrimPrefix(name, "List")))
-	case strings.HasPrefix(name, "Create"):
-		return "POST", "/v1/" + toSnakeCase(pluralize(strings.TrimPrefix(name, "Create")))
-	case strings.HasPrefix(name, "Update"):
-		return "PUT", "/v1/" + toSnakeCase(pluralize(strings.TrimPrefix(name, "Update"))) + "/{id}"
-	case strings.HasPrefix(name, "Delete"):
-		return "DELETE", "/v1/" + toSnakeCase(pluralize(strings.TrimPrefix(name, "Delete"))) + "/{id}"
-	default:
-		return "GET", "/v1/" + toSnakeCase(name)
-	}
 }
 
 func toHandlerName(serviceName string) string {
 	return strings.TrimSuffix(serviceName, "Service") + "Handler"
 }
 
-func pluralize(s string) string {
-	if s == "" {
-		return "items"
-	}
-	// Already plural
-	if strings.HasSuffix(s, "s") || strings.HasSuffix(s, "es") || strings.HasSuffix(s, "ies") {
-		return s
-	}
-	last := s[len(s)-1]
-	if last == 'y' && len(s) > 1 {
-		return s[:len(s)-1] + "ies"
-	}
-	if last == 's' {
-		return s + "es"
-	}
-	return s + "s"
-}
-
-func toSnakeCase(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteRune('_')
-		}
-		result.WriteRune(r)
-	}
-	return strings.ToLower(result.String())
-}
-
 // Generate handler interfaces (not implementations)
-func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo, pkgName string, generatedErrorTypes map[string]bool, errorPkg string, errorType string) {
+func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo, pkgName string, errorTypesKey string, generatedErrorTypes map[string]bool, errorPkg string, errorType string) {
 	g.P("// Code generated by protoc-gen-echo-http. DO NOT EDIT.")
 	g.P("// versions:")
 	g.P("// \tprotoc-gen-echo-http ", version)
@@ -284,7 +300,7 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 		for _, method := range svc.Methods {
 			if len(method.PathParams) > 0 && method.ProtoMethod != nil {
 				for _, param := range method.PathParams {
-					kind := getFieldType(method.ProtoMethod, param)
+					kind := getFieldType(method.ProtoMethod, param.Name)
 					if kind == protoreflect.Uint32Kind || kind == protoreflect.Uint64Kind ||
 						kind == protoreflect.Int32Kind || kind == protoreflect.Int64Kind {
 						needsStrconv = true
@@ -304,7 +320,9 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	// Generate imports
 	g.P("import (")
 	g.P(`	"context"`)
-	if needsStrconv {
+	g.P(`	"errors"`)
+	g.P(`	"net/http"`)
+	if needsStrconvServices(services) {
 		g.P(`	"strconv"`)
 	}
 	g.P(`	"github.com/labstack/echo/v5"`)
@@ -318,9 +336,12 @@ func generateHandlerInterfaces(g *protogen.GeneratedFile, services []serviceInfo
 	g.P()
 
 	// Generate error types only once per package
-	if !generatedErrorTypes[pkgName] {
+	if !generatedErrorTypes[errorTypesKey] {
 		generateErrorTypes(g, errorPkg, errorType)
-		generatedErrorTypes[pkgName] = true
+		if errorPkg == "" || errorType == "" {
+			generateAPIErrorHandler(g)
+		}
+		generatedErrorTypes[errorTypesKey] = true
 	}
 	g.P()
 
@@ -343,11 +364,11 @@ func generateErrorTypes(g *protogen.GeneratedFile, errorPkg string, errorType st
 		// Generate error constants using external type (no local type definition)
 		g.P("// Error constants using external type from ", errorPkg)
 		g.P("var (")
-		g.P("\tErrBadRequest     = &", fullTypeName, "{Code: 400, Message: \"bad request\"}")
-		g.P("\tErrUnauthorized  = &", fullTypeName, "{Code: 401, Message: \"unauthorized\"}")
-		g.P("\tErrForbidden     = &", fullTypeName, "{Code: 403, Message: \"forbidden\"}")
-		g.P("\tErrNotFound      = &", fullTypeName, "{Code: 404, Message: \"not found\"}")
-		g.P("\tErrInternalError = &", fullTypeName, "{Code: 500, Message: \"internal server error\"}")
+		g.P("\tErrBadRequest     = &", fullTypeName, "{Code: http.StatusBadRequest, Message: \"bad request\"}")
+		g.P("\tErrUnauthorized  = &", fullTypeName, "{Code: http.StatusUnauthorized, Message: \"unauthorized\"}")
+		g.P("\tErrForbidden     = &", fullTypeName, "{Code: http.StatusForbidden, Message: \"forbidden\"}")
+		g.P("\tErrNotFound      = &", fullTypeName, "{Code: http.StatusNotFound, Message: \"not found\"}")
+		g.P("\tErrInternalError = &", fullTypeName, "{Code: http.StatusInternalServerError, Message: \"internal server error\"}")
 		g.P(")")
 		g.P()
 		return
@@ -364,31 +385,56 @@ func generateErrorTypes(g *protogen.GeneratedFile, errorPkg string, errorType st
 	g.P("\treturn e.Message")
 	g.P("}")
 	g.P()
+	g.P("// StatusCode implements echo.HTTPStatusCoder")
+	g.P("func (e *APIError) StatusCode() int {")
+	g.P("\treturn e.Code")
+	g.P("}")
+	g.P()
 	g.P("var (")
-	g.P("\tErrBadRequest     = &APIError{Code: 400, Message: \"bad request\"}")
-	g.P("\tErrUnauthorized  = &APIError{Code: 401, Message: \"unauthorized\"}")
-	g.P("\tErrForbidden     = &APIError{Code: 403, Message: \"forbidden\"}")
-	g.P("\tErrNotFound      = &APIError{Code: 404, Message: \"not found\"}")
-	g.P("\tErrInternalError = &APIError{Code: 500, Message: \"internal server error\"}")
+	g.P("\tErrBadRequest     = &APIError{Code: http.StatusBadRequest, Message: \"bad request\"}")
+	g.P("\tErrUnauthorized  = &APIError{Code: http.StatusUnauthorized, Message: \"unauthorized\"}")
+	g.P("\tErrForbidden     = &APIError{Code: http.StatusForbidden, Message: \"forbidden\"}")
+	g.P("\tErrNotFound      = &APIError{Code: http.StatusNotFound, Message: \"not found\"}")
+	g.P("\tErrInternalError = &APIError{Code: http.StatusInternalServerError, Message: \"internal server error\"}")
 	g.P(")")
 	g.P()
 }
 
-func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo, errorPkg string, errorType string) {
-	// Determine the error type to use
-	errType := "APIError"
-	if errorPkg != "" && errorType != "" {
-		parts := strings.Split(errorPkg, "/")
-		alias := parts[len(parts)-1]
-		errType = alias + "." + errorType
-	}
+func generateAPIErrorHandler(g *protogen.GeneratedFile) {
+	g.P("// RegisterAPIErrorHandler registers a custom HTTP error handler on the Echo instance")
+	g.P("// that returns APIError-formatted JSON responses with the correct HTTP status code.")
+	g.P("func RegisterAPIErrorHandler(e *echo.Echo) {")
+	g.P("\te.HTTPErrorHandler = func(c *echo.Context, err error) {")
+	g.P("\t\tif resp, uErr := echo.UnwrapResponse(c.Response()); uErr == nil && resp.Committed {")
+	g.P("\t\t\treturn")
+	g.P("\t\t}")
+	g.P()
+	g.P("\t\tcode := http.StatusInternalServerError")
+	g.P("\t\tvar sc echo.HTTPStatusCoder")
+	g.P("\t\tif errors.As(err, &sc) && sc.StatusCode() != 0 {")
+	g.P("\t\t\tcode = sc.StatusCode()")
+	g.P("\t\t}")
+	g.P()
+	g.P("\t\tvar msg string")
+	g.P("\t\tif he, ok := err.(*echo.HTTPError); ok {")
+	g.P("\t\t\tmsg = he.Message")
+	g.P("\t\t} else {")
+	g.P("\t\t\tmsg = err.Error()")
+	g.P("\t\t}")
+	g.P()
+	g.P("\t\tc.JSON(code, &APIError{Code: code, Message: msg})")
+	g.P("\t}")
+	g.P("}")
+	g.P()
+}
 
+func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo, errorPkg string, errorType string) {
 	// Generate handler interface
 	g.P("// ", svc.HandlerGo, " defines the interface for ", svc.GoName, " HTTP handlers")
 	g.P("type ", svc.HandlerGo, " interface {")
 	for _, method := range svc.Methods {
 		g.P("\t// ", method.GoName, " handles ", method.HTTPMethod, " ", method.Path)
-		g.P("\t", method.GoName, "(ctx context.Context, req *", method.InputName, ") (*", method.OutputName, ", error)")
+		g.P("\t", method.GoName, "(ctx context.Context, req *", g.QualifiedGoIdent(method.InputIdent), ") (*", g.QualifiedGoIdent(method.OutputIdent), ", error)")
 	}
 	g.P("}")
 	g.P()
@@ -403,47 +449,34 @@ func generateHandlerInterface(g *protogen.GeneratedFile, svc serviceInfo, errorP
 	// Generate adapter methods
 	for _, method := range svc.Methods {
 		g.P("func (a *", svc.HandlerGo, "Adapter) ", method.GoName, "(c *echo.Context) error {")
-		g.P("\tvar req ", method.InputName)
-		g.P("\tif err := c.Bind(&req); err != nil {")
-		g.P("\t\treturn c.JSON(400, &", errType, "{Code: 400, Message: err.Error()})")
-		g.P("\t}")
-		g.P()
+		g.P("\tvar req ", g.QualifiedGoIdent(method.InputIdent))
+		if method.HTTPMethod != "GET" && method.HTTPMethod != "DELETE" {
+			g.P("\tif err := c.Bind(&req); err != nil {")
+			g.P("\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+			g.P("\t}")
+			g.P()
+		}
 
 		// Bind path parameters
 		for _, param := range method.PathParams {
-			fieldName := toFieldName(param)
-			generatePathParamBinding(g, method.ProtoMethod, param, fieldName) // param = proto name, fieldName = Go name
+			generateParamBinding(g, method.ProtoMethod, param, "c.Param")
 		}
 		g.P()
 
 		// Bind query parameters (if any)
 		if len(method.QueryParams) > 0 {
 			for _, param := range method.QueryParams {
-				fieldName := toFieldName(param)
-				g.P("\tif v := c.QueryParam(\"", param, "\"); v != \"\" {")
-				g.P("\t\treq.", fieldName, " = v")
-				g.P("\t}")
+				generateParamBinding(g, method.ProtoMethod, param, "c.QueryParam")
 			}
 			g.P()
 		}
 
 		g.P("\tresp, err := a.Handler.", method.GoName, "(c.Request().Context(), &req)")
 		g.P("\tif err != nil {")
-		g.P("\t\tswitch e := err.(type) {")
-		if errorPkg != "" && errorType != "" {
-			parts := strings.Split(errorPkg, "/")
-			alias := parts[len(parts)-1]
-			g.P("\t\tcase *", alias, ".", errorType, ":")
-		} else {
-			g.P("\t\tcase *APIError:")
-		}
-		g.P("\t\t\treturn c.JSON(e.Code, e)")
-		g.P("\t\tdefault:")
-		g.P("\t\t\treturn c.JSON(500, &", errType, "{Code: 500, Message: err.Error()})")
-		g.P("\t\t}")
+		g.P("\t\treturn err")
 		g.P("\t}")
 		g.P()
-		g.P("\treturn c.JSON(200, resp)")
+		g.P("\treturn c.JSON(http.StatusOK, resp)")
 		g.P("}")
 		g.P()
 	}
@@ -460,68 +493,6 @@ func getFieldType(method *protogen.Method, fieldName string) protoreflect.Kind {
 	return protoreflect.Kind(0) // InvalidKind
 }
 
-// generatePathParamBinding generates path parameter binding code with type conversion.
-func generatePathParamBinding(g *protogen.GeneratedFile, method *protogen.Method, param string, fieldName string) {
-	g.P("\tif v := c.Param(\"", param, "\"); v != \"\" {")
-	kind := getFieldType(method, param) // param = proto field name
-	switch kind {
-	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
-		g.P("\t\tif parsed, err := strconv.ParseUint(v, 10, 64); err == nil {")
-		g.P("\t\t\treq.", fieldName, " = ", castToFieldType("parsed", kind))
-		g.P("\t\t}")
-	case protoreflect.Int32Kind, protoreflect.Int64Kind:
-		g.P("\t\tif parsed, err := strconv.ParseInt(v, 10, 64); err == nil {")
-		g.P("\t\t\treq.", fieldName, " = ", castToFieldType("parsed", kind))
-		g.P("\t\t}")
-	default:
-		// String fields: direct assignment
-		g.P("\t\treq.", fieldName, " = v")
-	}
-	g.P("\t}")
-}
-
-// castToFieldType generates a type cast expression for numeric types.
-func castToFieldType(val string, kind protoreflect.Kind) string {
-	switch kind {
-	case protoreflect.Uint32Kind:
-		return "uint32(" + val + ")"
-	case protoreflect.Uint64Kind:
-		return "uint64(" + val + ")"
-	case protoreflect.Int32Kind:
-		return "int32(" + val + ")"
-	case protoreflect.Int64Kind:
-		return "int64(" + val + ")"
-	default:
-		return val
-	}
-}
-
-func snakeToCamel(s string) string {
-	if !strings.Contains(s, "_") {
-		return s
-	}
-	parts := strings.Split(s, "_")
-	var resultBuilder strings.Builder
-	resultBuilder.WriteString(strings.ToLower(parts[0]))
-	for _, p := range parts[1:] {
-		if len(p) == 0 {
-			continue
-		}
-		resultBuilder.WriteString(strings.ToUpper(string(p[0])))
-		resultBuilder.WriteString(strings.ToLower(p[1:]))
-	}
-	return resultBuilder.String()
-}
-
-func toFieldName(param string) string {
-	camel := snakeToCamel(param)
-	if len(camel) == 0 {
-		return camel
-	}
-	// Convert first letter to uppercase for Go field names
-	return strings.ToUpper(camel[:1]) + camel[1:]
-}
-
 func generateRouteHelpers(g *protogen.GeneratedFile, services []serviceInfo, errorPkg string, errorType string) {
 	for _, svc := range services {
 		generateServiceRegistration(g, svc)
@@ -530,9 +501,15 @@ func generateRouteHelpers(g *protogen.GeneratedFile, services []serviceInfo, err
 
 func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
 	funcName := "Register" + svc.GoName + "Handlers"
-	g.P("// ", funcName, " registers ", svc.GoName, " handlers to the echo group.")
+	g.P("// ", funcName, " registers ", svc.GoName, " handlers to the router.")
 	g.P("func ", funcName, "(")
-	g.P("\tg *echo.Group,")
+	g.P("\tr interface {")
+	g.P("\t\tGET(path string, h echo.HandlerFunc)")
+	g.P("\t\tPOST(path string, h echo.HandlerFunc)")
+	g.P("\t\tPUT(path string, h echo.HandlerFunc)")
+	g.P("\t\tDELETE(path string, h echo.HandlerFunc)")
+	g.P("\t\tPATCH(path string, h echo.HandlerFunc)")
+	g.P("\t},")
 	g.P("\th ", svc.HandlerGo, ",")
 	g.P(") {")
 	g.P()
@@ -543,25 +520,22 @@ func generateServiceRegistration(g *protogen.GeneratedFile, svc serviceInfo) {
 
 	for _, method := range svc.Methods {
 		path := convertPath(method.Path)
-		g.P("\tg.", method.HTTPMethod, `("`, path, `", `, adapterName, ".", method.GoName, ")")
+		g.P("\tr.", method.HTTPMethod, `("`, path, `", `, adapterName, ".", method.GoName, ")")
 	}
 	g.P("}")
 	g.P()
 }
 
 func toAdapterName(serviceName string) string {
+	if serviceName == "" {
+		return "Adapter"
+	}
 	firstChar := strings.ToLower(string(serviceName[0]))
 	return firstChar + serviceName[1:] + "Adapter"
 }
 
 func convertPath(path string) string {
-	// Remove /v1 prefix if present
-	path = strings.TrimPrefix(path, "/v1")
-
-	// Convert {id} to :id
-	path = convertPathParams(path)
-
-	return path
+	return convertPathParams(path)
 }
 
 func convertPathParams(path string) string {
@@ -574,12 +548,52 @@ func convertPathParams(path string) string {
 		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
 			inner := part[1 : len(part)-1]
 			result.WriteString(":")
-			result.WriteString(snakeToCamel(inner))
+			result.WriteString(echoParamName(inner))
 		} else {
 			result.WriteString(part)
 		}
 	}
 	return result.String()
+}
+
+// generateParamBinding generates parameter binding code with type conversion.
+func generateParamBinding(g *protogen.GeneratedFile, method *protogen.Method, param paramBinding, accessor string) {
+	g.P("\tif v := ", accessor, `("`, echoParamName(param.Name), `"); v != "" {`)
+	kind := getFieldKind(method, param.Name)
+	switch kind {
+	case protoreflect.Int32Kind:
+		g.P("\t\tparsed, err := strconv.ParseInt(v, 10, 32)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = int32(parsed)")
+	case protoreflect.Int64Kind:
+		g.P("\t\tparsed, err := strconv.ParseInt(v, 10, 64)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = parsed")
+	case protoreflect.Uint32Kind:
+		g.P("\t\tparsed, err := strconv.ParseUint(v, 10, 32)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = uint32(parsed)")
+	case protoreflect.Uint64Kind:
+		g.P("\t\tparsed, err := strconv.ParseUint(v, 10, 64)")
+		g.P("\t\tif err != nil {")
+		g.P("\t\t\treturn echo.NewHTTPError(http.StatusBadRequest, err.Error())")
+		g.P("\t\t}")
+		g.P("\t\treq.", param.FieldGoName, " = parsed")
+	default:
+		// String fields: direct assignment
+		g.P("\t\treq.", param.FieldGoName, " = v")
+	}
+	g.P("\t}")
+}
+
+func echoParamName(param string) string {
+	return strings.Split(param, "=")[0]
 }
 
 // version can be set via -ldflags during build

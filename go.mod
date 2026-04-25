@@ -4,4 +4,4 @@ go 1.25.0
 
 require google.golang.org/protobuf v1.36.11
 
-require google.golang.org/genproto/googleapis/api v0.0.0-20260316180232-0b37fe3546d5 // indirect
+require google.golang.org/genproto/googleapis/api v0.0.0-20260420184626-e10c466a9529

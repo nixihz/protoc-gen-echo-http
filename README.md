@@ -95,22 +95,23 @@ func (h *UserHandlerImpl) ListUsers(ctx context.Context, req *proto.ListUsersReq
 ```go
 e := echo.New()
 
+// Optional: register custom error handler to preserve {code, message} JSON format
+proto.RegisterAPIErrorHandler(e)
+
 userHandler := &UserHandlerImpl{}
 proto.RegisterUserServiceHandlers(e.Group("/users"), userHandler)
 ```
 
-## Auto Route Mapping Rules
+`RegisterUserServiceHandlers` accepts any router that implements the `GET/POST/PUT/DELETE/PATCH` methods, including `*echo.Echo` and `*echo.Group`.
 
-| Method Name | HTTP Method | Path |
-|-------------|-------------|------|
-| GetXxx / GetXxxById | GET | /xxx/{id} |
-| ListXxx | GET | /xxx |
-| CreateXxx | POST | /xxx |
-| UpdateXxx | PUT | /xxx/{id} |
-| DeleteXxx | DELETE | /xxx/{id} |
-| Login | POST | /xxx/login |
-| Register | POST | /xxx/register |
-| Others | GET | /xxx |
+## Requirements
+
+- Go 1.25+
+- protoc
+- google.golang.org/protobuf v1.36.1
+- github.com/labstack/echo/v5
+
+> **Note:** This plugin only generates handlers for methods annotated with `google.api.http`. Methods without this annotation are skipped.
 
 ## Available Commands
 
@@ -127,13 +128,6 @@ task install
 task clean
 ```
 
-## Requirements
-
-- Go 1.25+
-- protoc
-- google.golang.org/protobuf v1.36.1
-- github.com/labstack/echo/v5
-
 ## Build
 
 ```bash
@@ -148,7 +142,8 @@ Running the plugin generates `_echo.pb.go` files containing:
 1. **Handler Interface** - e.g., `UserHandler`, defines all HTTP methods
 2. **Adapter** - e.g., `UserHandlerAdapter`, converts interface to Echo handler
 3. **Registration Function** - e.g., `RegisterUserServiceHandlers`, for easy route registration
-4. **Error Types** - `APIError` struct and common error constants (`ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`, `ErrInternalError`)
+4. **Error Types** - `APIError` struct (implements `echo.HTTPStatusCoder`) and common error constants (`ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`, `ErrInternalError`)
+5. **Error Handler** - `RegisterAPIErrorHandler(e *echo.Echo)` for centralized error handling with `APIError`-formatted JSON responses
 
 ### Error Handling
 
@@ -164,13 +159,13 @@ func (h *UserHandlerImpl) GetUser(ctx context.Context, req *proto.GetUserRequest
 }
 ```
 
-Error responses are automatically mapped to appropriate HTTP status codes:
+Error responses are automatically mapped to appropriate HTTP status codes. `APIError` implements `echo.HTTPStatusCoder`, so Echo's `HTTPErrorHandler` can extract the correct status code from returned errors.
 
 | Error Constant | HTTP Status |
 |-----------------|-------------|
-| `ErrBadRequest` | 400 |
-| `ErrUnauthorized` | 401 |
-| `ErrForbidden` | 403 |
-| `ErrNotFound` | 404 |
-| `ErrInternalError` | 500 |
+| `ErrBadRequest` | `http.StatusBadRequest` (400) |
+| `ErrUnauthorized` | `http.StatusUnauthorized` (401) |
+| `ErrForbidden` | `http.StatusForbidden` (403) |
+| `ErrNotFound` | `http.StatusNotFound` (404) |
+| `ErrInternalError` | `http.StatusInternalServerError` (500) |
 | Custom `APIError` | Custom code |

@@ -1,1 +1,19 @@
+# Binary
 protoc-gen-echo-http
+
+# Go vendor directory
+vendor/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Test coverage
+coverage.out
+coverage.html
